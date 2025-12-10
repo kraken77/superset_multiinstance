@@ -1,0 +1,33 @@
+version: "3.9"
+networks:
+  ragnetwork:
+    name: ragnetwork
+    driver: bridge
+    external: true
+
+services:
+  mcp-server:
+    build: .
+    ports:
+      - "8903:8900"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    volumes:
+      - superset_login_data:/app/supersetLogin
+    networks:
+      - ragnetwork
+
+  cookie-refresher:
+    build: .
+    command: ./refresher.sh
+    env_file:
+      - .env
+    volumes:
+      - superset_login_data:/app/supersetLogin
+    networks:
+      - ragnetwork
+
+volumes:
+  superset_login_data:

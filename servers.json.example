@@ -1,0 +1,29 @@
+
+{
+  "superset_main": {
+    "base_url": "http://YOUR_SUPERSET_URL:8088",
+    "username": "YOUR_USERNAME",
+    "password": "YOUR_PASSWORD"
+  },
+  "another_superset_instance": {
+    "base_url": "http://ANOTHER_URL:8088",
+    "username": "ANOTHER_USERNAME",
+    "password": "ANOTHER_PASSWORD"
+  },
+  "superset_cookie_auth": {
+    "base_url": "https://sandbox.portabo.cz",
+    "auth_method": "cookie",
+    "cookie_file_path": "cookies.txt"
+    "username": "keycloak-USERNAME",
+    "password": "keyclaok-PASSWORD"
+
+},
+    "superset_cookie_auth_http_auth_portabo": {
+    "base_url": "https://http_user:http_password@bi.portabo.dev",
+    "auth_method": "cookie_http_auth",
+    "cookie_file_path": "/app/supersetLogin/bi_portabo-cookies.txt",
+    "username": "keyclaok-USERNAME",
+    "password": "keyclaok-PASSWORD"
+  }
+
+}

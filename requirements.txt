@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+fastapi-mcp
+pytest
+playwright

@@ -1,0 +1,415 @@
+import httpx
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Path
+from pydantic import BaseModel
+import os
+import json
+import uvicorn
+import asyncio
+import logging
+import sys
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Callable
+from fastapi_mcp import FastApiMCP
+
+# --- Základní nastavení ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
+logger = logging.getLogger(__name__)
+
+# --- Datové struktury ---
+@dataclass
+class SupersetServerConfig:
+    base_url: str
+    username: str
+    password: str
+
+@dataclass
+class SupersetContext:
+    config: SupersetServerConfig
+    client: httpx.AsyncClient
+    access_token: Optional[str] = None
+    csrf_token: Optional[str] = None
+    token_path: Optional[str] = None
+
+# --- Správce spojení ---
+class ConnectionManager:
+    def __init__(self, token_dir: str = "."):
+        self._contexts: Dict[str, SupersetContext] = {}
+        self._token_dir = token_dir
+        os.makedirs(self._token_dir, exist_ok=True)
+
+    def get_token_path(self, server_id: str) -> str:
+        return os.path.join(self._token_dir, f".superset_token_{server_id}")
+
+    def load_servers(self, config_path: str = "servers.json"):
+        logger.info(f"Načítám konfiguraci serverů z {config_path}")
+        try:
+            with open(config_path, 'r') as f:
+                servers_config = json.load(f)
+            for server_id, config_data in servers_config.items():
+                config = SupersetServerConfig(**config_data)
+                client = httpx.AsyncClient(base_url=config.base_url, timeout=30.0)
+                token_path = self.get_token_path(server_id)
+                self._contexts[server_id] = SupersetContext(config=config, client=client, token_path=token_path)
+                logger.info(f"Server '{server_id}' nakonfigurován pro URL: {config.base_url}")
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.error(f"Chyba při načítání konfigurace: {e}")
+            sys.exit(1)
+
+    async def load_tokens_for_all_servers(self):
+        logger.info("Načítám uložené tokeny pro všechny servery...")
+        for server_id, context in self._contexts.items():
+            self.load_token(server_id)
+
+    def load_token(self, server_id: str):
+        context = self.get_context(server_id)
+        if context.token_path and os.path.exists(context.token_path):
+            try:
+                with open(context.token_path, 'r') as f:
+                    tokens = json.load(f)
+                context.access_token = tokens.get("access_token")
+                context.csrf_token = tokens.get("csrf_token")
+                if context.access_token:
+                    context.client.headers.update({"Authorization": f"Bearer {context.access_token}"})
+                    logger.info(f"Token pro server '{server_id}' úspěšně načten.")
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Chyba při načítání tokenu pro server '{server_id}': {e}")
+
+    def save_token(self, server_id: str):
+        context = self.get_context(server_id)
+        if context.token_path:
+            try:
+                with open(context.token_path, 'w') as f:
+                    json.dump({
+                        "access_token": context.access_token,
+                        "csrf_token": context.csrf_token
+                    }, f)
+                logger.info(f"Token pro server '{server_id}' úspěšně uložen.")
+            except IOError as e:
+                logger.error(f"Chyba při ukládání tokenu pro server '{server_id}': {e}")
+
+    def clear_token(self, server_id: str):
+        context = self.get_context(server_id)
+        context.access_token = None
+        context.csrf_token = None
+        context.client.headers.pop("Authorization", None)
+        if context.token_path and os.path.exists(context.token_path):
+            try:
+                os.remove(context.token_path)
+                logger.info(f"Token pro server '{server_id}' úspěšně smazán.")
+            except OSError as e:
+                logger.error(f"Chyba při mazání tokenu pro server '{server_id}': {e}")
+
+    async def close_all(self):
+        logger.info("Zavírám všechna spojení...")
+        for context in self._contexts.values():
+            await context.client.aclose()
+
+    def get_context(self, server_id: str) -> SupersetContext:
+        context = self._contexts.get(server_id)
+        if not context:
+            raise HTTPException(status_code=404, detail=f"Server s ID '{server_id}' nebyl nalezen.")
+        return context
+
+connection_manager = ConnectionManager()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    connection_manager.load_servers()
+    await connection_manager.load_tokens_for_all_servers()
+    yield
+    await connection_manager.close_all()
+
+app = FastAPI(title="Multi-Superset MCP Server", version="2.0.0", lifespan=lifespan)
+api_router = APIRouter()
+
+# --- Závislosti a pomocné funkce ---
+def get_server_context(server_id: str = Path(..., title="ID Superset serveru")) -> SupersetContext:
+    return connection_manager.get_context(server_id)
+
+async def make_api_request(method: str, endpoint: str, ctx: SupersetContext, data: Optional[Dict] = None, params: Optional[Dict] = None) -> Dict:
+    headers = {}
+    if not ctx.access_token:
+        logger.warning(f"Chybí access token pro {ctx.config.base_url}. Pokus o přihlášení.")
+        await superset_auth_authenticate_user(ctx)
+
+    if method.lower() != "get":
+        if not ctx.csrf_token:
+            await get_csrf_token(ctx)
+        if ctx.csrf_token:
+            headers["X-CSRFToken"] = ctx.csrf_token
+
+    try:
+        response = await ctx.client.request(method, endpoint, json=data, params=params, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            logger.info(f"Chyba 401 na serveru {ctx.config.base_url}. Pokouším se o re-autentizaci...")
+            await superset_auth_authenticate_user(ctx)
+            # Po úspěšné re-autentizaci je potřeba aktualizovat hlavičky
+            new_headers = headers.copy()
+            if ctx.csrf_token:
+                 new_headers["X-CSRFToken"] = ctx.csrf_token
+
+            response = await ctx.client.request(method, endpoint, json=data, params=params, headers=new_headers)
+            response.raise_for_status()
+            return response.json()
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text) from e
+    except Exception as e:
+        logger.error(f"Neočekávaná chyba v API požadavku: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def get_csrf_token(ctx: SupersetContext):
+    try:
+        response = await ctx.client.get("/api/v1/security/csrf_token/")
+        response.raise_for_status()
+        data = response.json()
+        ctx.csrf_token = data.get("result")
+        if ctx.csrf_token:
+            connection_manager.save_token(ctx.config.username) # Uložení po získání
+    except Exception as e:
+        logger.error(f"Nepodařilo se získat CSRF token pro {ctx.config.base_url}: {e}")
+
+# --- API Endpoints ---
+
+@api_router.post("/{server_id}/auth/login", summary="Authenticate with a Superset instance", operation_id="superset_auth_authenticate_user")
+async def superset_auth_authenticate_user(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+    try:
+        response = await ctx.client.post("/api/v1/security/login", json={
+            "username": ctx.config.username,
+            "password": ctx.config.password,
+            "provider": "db", "refresh": True
+        })
+        response.raise_for_status()
+        data = response.json()
+        ctx.access_token = data.get("access_token")
+        ctx.client.headers.update({"Authorization": f"Bearer {ctx.access_token}"})
+        await get_csrf_token(ctx) # Tím se získá i CSRF a vše se uloží
+        connection_manager.save_token(next(iter(connection_manager._contexts.keys())))
+        return {"message": f"Úspěšně přihlášen k serveru '{ctx.config.base_url}'."}
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text) from e
+
+@api_router.post("/{server_id}/auth/logout", summary="Log out from a Superset instance", operation_id="superset_auth_logout")
+async def superset_auth_logout(server_id: str, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+    connection_manager.clear_token(server_id)
+    return {"message": f"Úspěšně odhlášen ze serveru '{server_id}'."}
+
+
+# --- Dynamically created endpoints ---
+def create_dynamic_endpoints():
+    # Autentizační nástroje
+    @api_router.get("/{server_id}/auth/check", summary="Check token validity", operation_id="superset_auth_check_token_validity")
+    async def superset_auth_check_token_validity(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        if not ctx.access_token:
+            return {"valid": False, "error": "Chybí lokální access token."}
+        try:
+            # Použijeme endpoint, který vyžaduje autentizaci
+            await make_api_request("get", "/api/v1/me/", ctx)
+            return {"valid": True}
+        except HTTPException as e:
+            return {"valid": False, "status_code": e.status_code, "error": e.detail}
+
+    @api_router.post("/{server_id}/auth/refresh", summary="Refresh access token", operation_id="superset_auth_refresh_token")
+    async def superset_auth_refresh_token(server_id: str, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        try:
+            response = await ctx.client.post("/api/v1/security/refresh")
+            response.raise_for_status()
+            data = response.json()
+            ctx.access_token = data.get("access_token")
+            ctx.client.headers.update({"Authorization": f"Bearer {ctx.access_token}"})
+            connection_manager.save_token(server_id)
+            return {"message": "Token úspěšně obnoven.", "access_token": ctx.access_token}
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.text) from e
+
+    # Dashboard Tools
+    @api_router.get("/{server_id}/dashboards", summary="List dashboards", operation_id="superset_dashboard_list")
+    async def superset_dashboard_list(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/dashboard/", ctx)
+
+    @api_router.get("/{server_id}/dashboards/{dashboard_id}", summary="Get dashboard by ID", operation_id="superset_dashboard_get_by_id")
+    async def superset_dashboard_get_by_id(dashboard_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", f"/api/v1/dashboard/{dashboard_id}", ctx)
+
+    class DashboardCreate(BaseModel):
+        dashboard_title: str
+        json_metadata: Optional[Dict[str, Any]] = None
+
+    @api_router.post("/{server_id}/dashboards", summary="Create a dashboard", operation_id="superset_dashboard_create")
+    async def superset_dashboard_create(payload: DashboardCreate, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("post", "/api/v1/dashboard/", ctx, data=payload.model_dump())
+
+    @api_router.put("/{server_id}/dashboards/{dashboard_id}", summary="Update a dashboard", operation_id="superset_dashboard_update")
+    async def superset_dashboard_update(dashboard_id: int, payload: Dict[str, Any], ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("put", f"/api/v1/dashboard/{dashboard_id}", ctx, data=payload)
+
+    @api_router.delete("/{server_id}/dashboards/{dashboard_id}", summary="Delete a dashboard", operation_id="superset_dashboard_delete")
+    async def superset_dashboard_delete(dashboard_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        response = await make_api_request("delete", f"/api/v1/dashboard/{dashboard_id}", ctx)
+        if not response.get("error"):
+            return {"message": f"Dashboard {dashboard_id} smazán úspěšně."}
+        return response
+
+    # Chart Tools
+    @api_router.get("/{server_id}/charts", summary="List charts", operation_id="superset_chart_list")
+    async def superset_chart_list(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/chart/", ctx)
+
+    @api_router.get("/{server_id}/charts/{chart_id}", summary="Get chart by ID", operation_id="superset_chart_get_by_id")
+    async def superset_chart_get_by_id(chart_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", f"/api/v1/chart/{chart_id}", ctx)
+
+    class ChartCreate(BaseModel):
+        slice_name: str
+        datasource_id: int
+        datasource_type: str
+        viz_type: str
+        params: Dict[str, Any]
+
+    @api_router.post("/{server_id}/charts", summary="Create a chart", operation_id="superset_chart_create")
+    async def superset_chart_create(payload: ChartCreate, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("post", "/api/v1/chart/", ctx, data=payload.model_dump())
+
+    @api_router.put("/{server_id}/charts/{chart_id}", summary="Update a chart", operation_id="superset_chart_update")
+    async def superset_chart_update(chart_id: int, payload: Dict[str, Any], ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("put", f"/api/v1/chart/{chart_id}", ctx, data=payload)
+
+    @api_router.delete("/{server_id}/charts/{chart_id}", summary="Delete a chart", operation_id="superset_chart_delete")
+    async def superset_chart_delete(chart_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        response = await make_api_request("delete", f"/api/v1/chart/{chart_id}", ctx)
+        if not response.get("error"):
+            return {"message": f"Graf {chart_id} smazán úspěšně."}
+        return response
+
+    # Database Tools
+    class DatabaseCreate(BaseModel):
+        engine: str
+        configuration_method: str
+        database_name: str
+        sqlalchemy_uri: str
+
+    class ValidateSQL(BaseModel):
+        sql: str
+
+    @api_router.get("/{server_id}/databases", summary="List databases", operation_id="superset_database_list")
+    async def superset_database_list(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/database/", ctx)
+
+    @api_router.get("/{server_id}/databases/{database_id}", summary="Get database by ID", operation_id="superset_database_get_by_id")
+    async def superset_database_get_by_id(database_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", f"/api/v1/database{/database_id}", ctx)
+
+    @api_router.post("/{server_id}/databases", summary="Create a database connection", operation_id="superset_database_create")
+    async def superset_database_create(payload: DatabaseCreate, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("post", "/api/v1/database/", ctx, data=payload.model_dump())
+
+    @api_router.get("/{server_id}/databases/{database_id}/tables", summary="Get database tables", operation_id="superset_database_get_tables")
+    async def superset_database_get_tables(database_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", f"/api/v1/database/{database_id}/tables/", ctx)
+
+    @api_router.get("/{server_id}/databases/{database_id}/schemas", summary="Get database schemas", operation_id="superset_database_schemas")
+    async def superset_database_schemas(database_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", f"/api/v1/database/{database_id}/schemas/", ctx)
+
+    @api_router.post("/{server_id}/databases/test_connection", summary="Test a database connection", operation_id="superset_database_test_connection")
+    async def superset_database_test_connection(payload: Dict[str, Any], ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("post", "/api/v1/database/test_connection", ctx, data=payload)
+
+    @api_router.put("/{server_id}/databases/{database_id}", summary="Update a database connection", operation_id="superset_database_update")
+    async def superset_database_update(database_id: int, payload: Dict[str, Any], ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("put", f"/api/v1/database/{database_id}", ctx, data=payload)
+
+    @api_router.delete("/{server_id}/databases/{database_id}", summary="Delete a database connection", operation_id="superset_database_delete")
+    async def superset_database_delete(database_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        response = await make_api_request("delete", f"/api/v1/database/{database_id}", ctx)
+        if not response.get("error"):
+            return {"message": f"Databáze {database_id} smazána úspěšně."}
+        return response
+
+    @api_router.post("/{server_id}/databases/{database_id}/validate_sql", summary="Validate SQL", operation_id="superset_database_validate_sql")
+    async def superset_database_validate_sql(database_id: int, payload: ValidateSQL, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("post", f"/api/v1/database/{database_id}/validate_sql/", ctx, data=payload.model_dump())
+
+    # Dataset Tools
+    class DatasetCreate(BaseModel):
+        database: int
+        table_name: str
+        schema: Optional[str] = None
+
+    @api_router.get("/{server_id}/datasets", summary="List datasets", operation_id="superset_dataset_list")
+    async def superset_dataset_list(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/dataset/", ctx)
+
+    @api_router.get("/{server_id}/datasets/{dataset_id}", summary="Get dataset by ID", operation_id="superset_dataset_get_by_id")
+    async def superset_dataset_get_by_id(dataset_id: int, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", f"/api/v1/dataset/{dataset_id}", ctx)
+
+    @api_router.post("/{server_id}/datasets", summary="Create a dataset", operation_id="superset_dataset_create")
+    async def superset_dataset_create(payload: DatasetCreate, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("post", "/api/v1/dataset/", ctx, data=payload.model_dump())
+
+    # SQL Lab Tools
+    class ExecuteSQL(BaseModel):
+        database_id: int
+        sql: str
+
+    class FormatSQL(BaseModel):
+        sql: str
+
+    @api_router.post("/{server_id}/sqllab/execute", summary="Execute SQL query", operation_id="superset_sqllab_execute_query")
+    async def superset_sqllab_execute_query(payload: ExecuteSQL, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("post", "/api/v1/sqllab/execute/", ctx, data=payload.model_dump())
+
+    @api_router.get("/{server_id}/sqllab/saved_queries", summary="Get saved queries", operation_id="superset_sqllab_get_saved_queries")
+    async def superset_sqllab_get_saved_queries(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/saved_query/", ctx)
+
+    @api_router.post("/{server_id}/sqllab/format_sql", summary="Format SQL query", operation_id="superset_sqllab_format_sql")
+    async def superset_sqllab_format_sql(payload: FormatSQL, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("post", "/api/v1/sqllab/format_sql", ctx, data=payload.model_dump())
+
+    @api_router.get("/{server_id}/sqllab/results/{key}", summary="Get query results", operation_id="superset_sqllab_get_results")
+    async def superset_sqllab_get_results(key: str, ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", f"/api/v1/sqllab/results/", ctx, params={"key": key})
+
+    # Ostatní nástroje
+    @api_router.get("/{server_id}/activity/recent", summary="Get recent activity", operation_id="superset_activity_get_recent")
+    async def superset_activity_get_recent(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/log/recent_activity/", ctx)
+
+    @api_router.get("/{server_id}/user/current", summary="Get current user", operation_id="superset_user_get_current")
+    async def superset_user_get_current(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/me/", ctx)
+
+    @api_router.get("/{server_id}/user/roles", summary="Get user roles", operation_id="superset_user_get_roles")
+    async def superset_user_get_roles(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/me/roles/", ctx)
+
+    @api_router.get("/{server_id}/tags", summary="List tags", operation_id="superset_tag_list")
+    async def superset_tag_list(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return await make_api_request("get", "/api/v1/tag/", ctx)
+
+    @api_router.get("/{server_id}/config/base_url", summary="Get base URL", operation_id="superset_config_get_base_url")
+    async def superset_config_get_base_url(ctx: SupersetContext = Depends(get_server_context)) -> Dict:
+        return {"base_url": ctx.config.base_url}
+
+    @api_router.get("/config/server_info", summary="Get information about configured Superset servers", operation_id="superset_config_get_server_info")
+    async def superset_config_get_server_info() -> Dict:
+        servers_info = []
+        for server_id, context in connection_manager._contexts.items():
+            servers_info.append({"id": server_id, "base_url": context.config.base_url})
+        return {"server_count": len(servers_info), "servers": servers_info}
+
+create_dynamic_endpoints()
+app.include_router(api_router)
+mcp_server = FastApiMCP(app)
+mcp_server.mount(app)
+
+@app.get("/")
+async def root():
+    return {"message": "Multi-Superset MCP Server je spuštěn."}
+
+if __name__ == "__main__":
+    uvicorn.run("main_docker:app", host="0.0.0.0", port=8900, reload=True)
